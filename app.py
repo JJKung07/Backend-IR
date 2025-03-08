@@ -1,4 +1,5 @@
 import os
+from spellchecker import SpellChecker
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
@@ -11,7 +12,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Configuration
-app.config['SECRET_KEY'] = 'your-secret-key-for-jwt'  # Change this in production
+app.config['SECRET_KEY'] = '56d06939523008f63729b436b6872a7b017b1a6389fbf16f2d98d828471ce5e2'  # Change this in production
 app.config['JWT_EXPIRATION_DELTA'] = 24 * 60 * 60  # 24 hours in seconds
 DB_PATH = 'resoures/db.db'
 
@@ -274,6 +275,89 @@ def get_user_profile(user_id):
         'created_at': user['created_at']
     }), 200
 
+
+def correct_typos(query):
+    """Correct typos in the search query"""
+    spell = SpellChecker()
+    corrected_words = [spell.correction(word) or word for word in query.split()]
+    return ' '.join(corrected_words)
+
+
+@app.route('/api/search', methods=['GET'])
+@token_required
+def search_recipes(user_id):
+    raw_query = request.args.get('query', '').strip().lower()
+    search_type = request.args.get('type', 'all')  # all/name/ingredient/process
+
+    # Correct typos
+    corrected_query = correct_typos(raw_query)
+    if raw_query != corrected_query:
+        return jsonify({
+            'suggestion': corrected_query,
+            'message': 'Did you mean:'
+        }), 200
+
+    # Build dynamic SQL based on search type
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    search_terms = []
+    conditions = []
+
+    # WHERE clause parameters
+    if search_type in ['all', 'name']:
+        conditions.append("Name LIKE ?")
+        search_terms.append(f"%{corrected_query}%")
+
+    if search_type in ['all', 'ingredient']:
+        conditions.append("RecipeIngredientParts LIKE ?")
+        search_terms.append(f"%{corrected_query}%")
+
+    if search_type in ['all', 'process']:
+        conditions.append("RecipeInstructions LIKE ?")
+        search_terms.append(f"%{corrected_query}%")
+
+    # CASE statement parameters (needs 3 placeholders)
+    case_params = [f"%{corrected_query}%"] * 3
+
+    # Combine all parameters
+    all_params = search_terms + case_params
+
+    # Final SQL query
+    sql = f'''
+    SELECT *,
+        (CASE 
+            WHEN Name LIKE ? THEN 3 
+            WHEN RecipeIngredientParts LIKE ? THEN 2 
+            WHEN RecipeInstructions LIKE ? THEN 1 
+            ELSE 0 
+        END) AS relevance
+    FROM recipes
+    {'WHERE ' + ' OR '.join(conditions) if conditions else ''}
+    ORDER BY relevance DESC, AggregatedRating DESC
+    LIMIT 20
+    '''
+
+    try:
+        # Execute with combined parameters
+        cursor.execute(sql, all_params)
+        results = cursor.fetchall()
+    finally:
+        conn.close()
+
+    # Format results
+    recipes = [{
+        'recipeId': row['RecipeId'],
+        'name': row['Name'],
+        'image': row['Images'].split(',')[0] if row['Images'] else None,
+        'rating': row['AggregatedRating'],
+        'ingredients': row['RecipeIngredientParts'].split(', ') if row['RecipeIngredientParts'] else [],
+        'matchType': 'Name' if row['relevance'] == 3 else
+        'Ingredients' if row['relevance'] == 2 else
+        'Instructions'
+    } for row in results]
+
+    return jsonify({'results': recipes}), 200
 
 if __name__ == '__main__':
     app.run(debug=True)
