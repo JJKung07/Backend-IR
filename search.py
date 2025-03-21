@@ -5,9 +5,9 @@ import sqlite3
 import Levenshtein
 from datetime import datetime, timedelta
 from spellchecker import SpellChecker
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from flask_cors import CORS
-from elasticsearch import Elasticsearch, logger
+from elasticsearch import Elasticsearch
 
 search_bp = Blueprint('search', __name__)
 CORS(search_bp, resources={r"/api/*": {"origins": "*"}})
@@ -25,7 +25,11 @@ es_client = Elasticsearch(
 )
 
 # SQLite connection helper
-DB_PATH = 'resoures/db.db'
+DB_PATH = 'resources/db.db'
+
+# Global variables for caching common terms
+common_terms = []
+last_updated = 0
 
 
 def get_db_connection():
@@ -107,51 +111,103 @@ def correct_typos(query):
 
 
 def get_common_food_terms():
-    try:
-        ingredient_aggs = es_client.search(
-            index="recipes",
-            body={"size": 0,
-                  "aggs": {"ingredients": {"terms": {"field": "RecipeIngredientParts.keyword", "size": 1000}}}}
-        )
-        keyword_aggs = es_client.search(
-            index="recipes",
-            body={"size": 0, "aggs": {"keywords": {"terms": {"field": "Keywords.keyword", "size": 1000}}}}
-        )
+    """Fetch and cache common food terms from Elasticsearch, refreshing every hour."""
+    global common_terms, last_updated
+    if time.time() - last_updated > 3600:  # Refresh every hour
+        try:
+            ingredient_aggs = es_client.search(
+                index="recipes",
+                body={"size": 0,
+                      "aggs": {"ingredients": {"terms": {"field": "RecipeIngredientParts.keyword", "size": 1000}}}}
+            )
+            keyword_aggs = es_client.search(
+                index="recipes",
+                body={"size": 0, "aggs": {"keywords": {"terms": {"field": "Keywords.keyword", "size": 1000}}}}
+            )
 
-        ingredients = [bucket["key"] for bucket in ingredient_aggs["aggregations"]["ingredients"]["buckets"]]
-        keywords = [bucket["key"] for bucket in keyword_aggs["aggregations"]["keywords"]["buckets"]]
+            ingredients = [bucket["key"] for bucket in ingredient_aggs["aggregations"]["ingredients"]["buckets"]]
+            keywords = [bucket["key"] for bucket in keyword_aggs["aggregations"]["keywords"]["buckets"]]
 
-        common_terms = set()
-        for term_list in [ingredients, keywords]:
-            for term in term_list:
-                for word in term.split():
-                    if len(word) > 2:
-                        common_terms.add(word)
-        return list(common_terms)
-    except Exception as e:
-        logger.error(f"Error retrieving common food terms: {str(e)}")
-        return []
+            common_terms = set()
+            for term_list in [ingredients, keywords]:
+                for term in term_list:
+                    for word in term.split():
+                        if len(word) > 2:
+                            common_terms.add(word.lower())
+            common_terms = list(common_terms)
+            last_updated = time.time()
+        except Exception as e:
+            current_app.logger.error(f"Error updating common food terms: {str(e)}")
+    return common_terms
 
+def correct_typos(query):
+    """Correct typos in the query using cached common food terms and a spell checker."""
+    spell = SpellChecker()
+    words = query.lower().split()
+    corrected_words = []
+    common_terms = get_common_food_terms()
+
+    for word in words:
+        if len(word) <= 2:
+            corrected_words.append(word)
+            continue
+
+        closest_term = None
+        min_distance = float('inf')
+
+        for term in common_terms:
+            distance = Levenshtein.distance(word, term.lower())
+            if distance < min(3, len(word) // 2) and distance < min_distance:
+                min_distance = distance
+                closest_term = term
+
+        if closest_term:
+            corrected_words.append(closest_term)
+        else:
+            correction = spell.correction(word)
+            corrected_words.append(correction if correction else word)
+
+    return ' '.join(corrected_words)
 
 def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=False, has_cooktime=False):
+    """Search Elasticsearch with enhanced scoring based on ratings and review counts."""
     from_val = (page - 1) * size
 
     search_body = {
         "from": from_val,
         "size": size,
         "query": {
-            "bool": {
-                "should": [
-                    {"match": {"Name": {"query": query, "boost": 3.0}}},
-                    {"match": {"RecipeIngredientParts": {"query": query, "boost": 2.0}}},
-                    {"match": {"RecipeInstructions": {"query": query, "boost": 1.5}}},
-                    {"match": {"Description": {"query": query, "boost": 1.0}}},
-                    {"match": {"Keywords": {"query": query, "boost": 1.0}}},
-                    {"match": {"Name": {"query": query, "fuzziness": "AUTO", "boost": 1.0}}},
-                    {"match": {"RecipeIngredientParts": {"query": query, "fuzziness": "AUTO", "boost": 0.8}}}
-                ],
-                "minimum_should_match": 1,
-                "filter": []
+            "function_score": {
+                "query": {
+                    "bool": {
+                        "should": [
+                            {"match": {"Name": {"query": query, "boost": 3.0}}},
+                            {"match": {"RecipeIngredientParts": {"query": query, "boost": 2.0}}},
+                            {"match": {"RecipeInstructions": {"query": query, "boost": 1.5}}},
+                            {"match": {"Description": {"query": query, "boost": 1.0}}},
+                            {"match": {"Keywords": {"query": query, "boost": 1.0}}},
+                            {"match": {"Name": {"query": query, "fuzziness": "AUTO", "boost": 1.0}}},
+                            {"match": {"RecipeIngredientParts": {"query": query, "fuzziness": "AUTO", "boost": 0.8}}}
+                        ],
+                        "minimum_should_match": 1,
+                        "filter": []
+                    }
+                },
+                "script_score": {
+                    "script": {
+                        "source": """
+                            double rating_factor = 1.0;
+                            if (doc['AggregatedRating'].size() > 0 && doc['AggregatedRating'].value > 0) {
+                                rating_factor = doc['AggregatedRating'].value / 5.0;
+                            }
+                            double review_factor = 1.0;
+                            if (doc['ReviewCount'].size() > 0) {
+                                review_factor = 1 + Math.log(1 + doc['ReviewCount'].value);
+                            }
+                            return _score * rating_factor * review_factor;
+                        """
+                    }
+                }
             }
         },
         "highlight": {
@@ -168,11 +224,11 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
 
     # Add filters based on parameters
     if has_rating:
-        search_body["query"]["bool"]["filter"].append({"exists": {"field": "AggregatedRating"}})
+        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "AggregatedRating"}})
     if has_image:
-        search_body["query"]["bool"]["filter"].append({"exists": {"field": "Images"}})
+        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "Images"}})
     if has_cooktime:
-        search_body["query"]["bool"]["filter"].append({"exists": {"field": "CookTime"}})
+        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "CookTime"}})
 
     result = es_client.search(index="recipes", body=search_body)
     total_hits = result["hits"]["total"]["value"]
@@ -204,9 +260,9 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
 
     return {"hits": hits, "total": total_hits}
 
-
 @search_bp.route('/api/search', methods=['GET'])
 def search_recipes():
+    """API endpoint to search for recipes."""
     query = request.args.get('q', '')
     page = int(request.args.get('page', 1))
     size = int(request.args.get('size', 10))
@@ -222,7 +278,7 @@ def search_recipes():
 
     if len(query) > 2:
         corrected_query = correct_typos(query)
-        if corrected_query == query:
+        if corrected_query and corrected_query == query:
             corrected_query = None
 
     try:
@@ -251,11 +307,11 @@ def search_recipes():
         }), 200
 
     except Exception as e:
-        logger.error(f"Search error: {str(e)}")
+        current_app.logger.error(f"Search error: {str(e)}")
         return jsonify({'error': 'An error occurred during search'}), 500
 
-
 def setup_elasticsearch_index():
+    """Set up the Elasticsearch index with mappings and settings."""
     index_name = "recipes"
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
@@ -316,8 +372,8 @@ def setup_elasticsearch_index():
 
     es_client.indices.create(index=index_name, body=mapping)
 
-
 def index_recipes_from_sqlite():
+    """Index recipes from SQLite into Elasticsearch."""
     setup_elasticsearch_index()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -328,17 +384,8 @@ def index_recipes_from_sqlite():
 
     for recipe in recipes:
         recipe_dict = dict(recipe)
-
-        # Fix inconsistent field names
-        if 'RecepieCategory' in recipe_dict:
-            recipe_dict['RecipeCategory'] = recipe_dict.pop('RecepieCategory')
-
-        if 'RecepieYield' in recipe_dict:
-            recipe_dict['RecipeYield'] = recipe_dict.pop('RecepieYield')
-
-        # Fix for recipeInstructions instead of RecipeInstructions
-        if 'recipeInstructions' in recipe_dict and 'RecipeInstructions' not in recipe_dict:
-            recipe_dict['RecipeInstructions'] = recipe_dict.pop('recipeInstructions')
+        if "description" in recipe_dict:
+            recipe_dict["Description"] = recipe_dict.pop("description")
 
         # Parse R-style vectors and handle "character(0)"
         vector_fields = [
@@ -378,18 +425,24 @@ def index_recipes_from_sqlite():
     conn.close()
     print(f"Indexed {len(recipes)} recipes")
 
+import click
 
-@search_bp.cli.command("index-recipes")
+@click.command("index-recipes")
 def index_recipes_command():
+    """CLI command to index recipes."""
     start_time = time.time()
     index_recipes_from_sqlite()
     elapsed_time = time.time() - start_time
     print(f"Indexing completed in {elapsed_time:.2f} seconds")
 
+def register_commands(app):
+    """Register CLI commands with the Flask app."""
+    app.cli.add_command(index_recipes_command)
 
-# Add debug endpoint for troubleshooting
+# Debug endpoint for troubleshooting
 @search_bp.route('/api/debug/recipe/<recipe_id>', methods=['GET'])
 def debug_recipe(recipe_id):
+    """API endpoint to debug a specific recipe by ID."""
     try:
         result = es_client.get(index="recipes", id=recipe_id)
         return jsonify(result['_source']), 200
