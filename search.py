@@ -1,9 +1,6 @@
-import csv
 import time
 import re
 import sqlite3
-from io import StringIO
-
 import Levenshtein
 from spellchecker import SpellChecker
 from flask import Blueprint, request, jsonify, current_app
@@ -40,17 +37,12 @@ def get_db_connection():
 
 
 def parse_r_vector(text):
-    if not text or text.strip().lower() in ["character(0)", "character(0)"]:
+    """Parse R-style vector strings into Python lists."""
+    if not text or text.lower() == "character(0)":
         return []
-    cleaned = re.sub(r'^c\(|\)$', '', text.strip())
-    if not cleaned:
-        return []
-    try:
-        reader = csv.reader(StringIO(cleaned), quotechar='"', skipinitialspace=True)
-        items = [item for row in reader for item in row if item.strip()]  # Flatten all rows
-    except Exception:
-        return []
-    return [item.strip().strip('\'"') for item in items if item.strip()]
+
+    cleaned = text.replace('c(', '').replace(')', '')
+    return [item.strip(' "\'') for item in cleaned.split(', ') if item.strip()]
 
 
 def clean_result(result):
@@ -63,39 +55,9 @@ def clean_result(result):
             return [html_pattern.sub('', item) for item in text]
         return html_pattern.sub('', str(text))
 
-        # Handle image arrays
-
-    images = []
-    # Check both 'Images' and 'image' keys due to potential case differences
-    for img_key in ['Images', 'image']:
-        if img_key in cleaned:
-            raw_images = cleaned[img_key]
-            # Parse if it's a string (R-vector)
-            if isinstance(raw_images, str):
-                parsed = parse_r_vector(raw_images)
-                images.extend(parsed)
-            elif isinstance(raw_images, list):
-                images.extend(raw_images)
-            # Remove the original key to avoid duplication
-            del cleaned[img_key]
-
-    # Filter valid image URLs
-    valid_images = [
-        img for img in images
-        if img and img.startswith('http') and 'character(0)' not in img
-    ]
-    cleaned['Images'] = valid_images
-    cleaned['image'] = valid_images[0] if valid_images else None
-
-    # Clean tags
-    if 'tags' in cleaned:
-        if isinstance(cleaned['tags'], str):  # Handle unparsed strings
-            cleaned['tags'] = parse_r_vector(cleaned['tags'])
-        cleaned['tags'] = [
-            re.sub(r'[\'"()]', '', tag).strip().title()
-            for tag in cleaned['tags']
-            if tag.strip() and tag.lower() != "character(0)"
-        ]
+    # Handle image arrays
+    if 'image' in cleaned and isinstance(cleaned['image'], list):
+        cleaned['image'] = cleaned['image'][0] if cleaned['image'] else None
 
     # Clean ingredients
     if 'ingredients' in cleaned:
@@ -249,7 +211,7 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
                 "id": hit["_id"],
                 "name": source.get("Name"),
                 "description": (source.get("Description", "")[:150] + "...") if source.get("Description") else "",
-                "Images": source.get("Images", []),  # Keep original capitalization for proper handling
+                "image": source.get("Images", []),
                 "tags": source.get("Keywords", []),
                 "rating": source.get("AggregatedRating", 0.0),
                 "reviewCount": source.get("ReviewCount", 0),
@@ -385,6 +347,7 @@ def setup_elasticsearch_index():
     es_client.indices.create(index=index_name, body=mapping)
 
 def index_recipes_from_sqlite():
+    """Index recipes from SQLite into Elasticsearch."""
     setup_elasticsearch_index()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -395,26 +358,6 @@ def index_recipes_from_sqlite():
 
     for recipe in recipes:
         recipe_dict = dict(recipe)
-
-        # Process vector fields (like Images, Keywords, etc.)
-        vector_fields = [
-            'RecipeIngredientParts', 'Keywords', 'Images',
-            'RecipeInstructions', 'RecipeIngredientQuantities'
-        ]
-
-        for field in vector_fields:
-            raw_value = recipe_dict.get(field, "")
-            if isinstance(raw_value, str):
-                # Handle "character(0)" case for empty vectors
-                if raw_value.strip() == "character(0)":
-                    recipe_dict[field] = []
-                else:
-                    # Parse R-style vectors
-                    recipe_dict[field] = parse_r_vector(raw_value)
-            else:
-                # If already a list (unlikely), ensure it's clean
-                recipe_dict[field] = parse_r_vector(str(raw_value))
-
         if "description" in recipe_dict:
             recipe_dict["Description"] = recipe_dict.pop("description")
 

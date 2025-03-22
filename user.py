@@ -1,4 +1,6 @@
 # user.py
+import random
+
 from flask import Blueprint, request, jsonify
 import sqlite3
 import csv
@@ -226,3 +228,66 @@ def delete_bookmark(user_id, folder_id, recipe_id):
     conn.close()
 
     return jsonify({'message': 'Bookmark removed successfully'}), 200
+
+def get_recommendations_for_folder(folder_id):
+    """Placeholder function to generate a list of recommended recipe IDs."""
+    conn = sqlite3.connect('Resources/db.db')
+    cursor = conn.cursor()
+    # Get recipe IDs already in the folder
+    cursor.execute('SELECT RecipeId FROM bookmarks WHERE FolderId = ?', (folder_id,))
+    bookmarked_ids = [row[0] for row in cursor.fetchall()]
+    if not bookmarked_ids:
+        conn.close()
+        return []  # Return empty list if folder is empty
+    # Get all recipe IDs not in the folder
+    placeholders = ','.join('?' * len(bookmarked_ids))
+    cursor.execute(f'SELECT RecipeId FROM recipes WHERE RecipeId NOT IN ({placeholders})', bookmarked_ids)
+    all_ids = [row[0] for row in cursor.fetchall()]
+    # Select up to 5 random recipe IDs as placeholder recommendations
+    recommendation_ids = random.sample(all_ids, min(5, len(all_ids))) if all_ids else []
+    conn.close()
+    return recommendation_ids
+
+
+@user_bp.route('/api/user/folders/<int:folder_id>/suggestions', methods=['GET'])
+@token_required
+def get_suggestions(user_id, folder_id):
+    conn = sqlite3.connect('Resources/db.db')
+    conn.row_factory = sqlite3.Row  # Set row factory to return dict-like rows
+    cursor = conn.cursor()
+
+    # Verify folder ownership
+    cursor.execute('SELECT user_id FROM folders WHERE FolderId = ?', (folder_id,))
+    folder = cursor.fetchone()
+    if not folder or folder[0] != user_id:
+        conn.close()
+        return jsonify({'error': 'Folder not found or access denied'}), 404
+
+    # Get recommendations
+    recommendation_ids = get_recommendations_for_folder(folder_id)
+    if not recommendation_ids:
+        conn.close()
+        return jsonify({'error': 'Cannot generate suggestions for an empty folder'}), 400
+
+    # Fetch recipe details
+    placeholders = ','.join('?' * len(recommendation_ids))
+    cursor.execute(f'''
+        SELECT RecipeId AS id, 
+               Name AS name,
+               Description AS description,
+               Keywords AS tags,
+               Images AS images
+        FROM recipes
+        WHERE RecipeId IN ({placeholders})
+    ''', recommendation_ids)
+    recipes = cursor.fetchall()
+    conn.close()
+
+    # Format the response
+    recipes_list = []
+    for recipe in recipes:
+        recipe_dict = dict(recipe)  # Now works because recipe is a Row object
+        for field in ['images', 'tags']:
+            recipe_dict[field] = parse_r_vector(recipe_dict.get(field, ''))
+        recipes_list.append(recipe_dict)
+    return jsonify(recipes_list)
