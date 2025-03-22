@@ -1,9 +1,3 @@
-import os
-import time
-
-import Levenshtein
-from elasticsearch import Elasticsearch
-from spellchecker import SpellChecker
 from flask import Blueprint, request, jsonify
 from flask_cors import CORS
 import sqlite3
@@ -18,7 +12,7 @@ CORS(auth_bp, resources={r"/api/*": {"origins": "*"}})
 # Configuration
 SECRET_KEY = '56d06939523008f63729b436b6872a7b017b1a6389fbf16f2d98d828471ce5e2'  # Change this in production
 JWT_EXPIRATION_DELTA = 24 * 60 * 60  # 24 hours in seconds
-DB_PATH = 'resoures/db.db'
+DB_PATH = 'Resources/db.db'
 
 # Database setup
 def init_db():

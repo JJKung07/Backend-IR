@@ -1,9 +1,7 @@
-import os
 import time
 import re
 import sqlite3
 import Levenshtein
-from datetime import datetime, timedelta
 from spellchecker import SpellChecker
 from flask import Blueprint, request, jsonify, current_app
 from flask_cors import CORS
@@ -25,7 +23,7 @@ es_client = Elasticsearch(
 )
 
 # SQLite connection helper
-DB_PATH = 'resources/db.db'
+DB_PATH = 'Resources/db.db'
 
 # Global variables for caching common terms
 common_terms = []
@@ -40,10 +38,11 @@ def get_db_connection():
 
 def parse_r_vector(text):
     """Parse R-style vector strings into Python lists."""
-    if not text:
+    if not text or text.lower() == "character(0)":
         return []
-    matches = re.findall(r'"([^"]*)"', text)
-    return matches if matches else [text]
+
+    cleaned = text.replace('c(', '').replace(')', '')
+    return [item.strip(' "\'') for item in cleaned.split(', ') if item.strip()]
 
 
 def clean_result(result):
@@ -79,36 +78,6 @@ def clean_result(result):
                 highlights[field] = parsed
 
     return cleaned
-
-
-def correct_typos(query):
-    spell = SpellChecker()
-    words = query.lower().split()
-    corrected_words = []
-    common_terms = get_common_food_terms()
-
-    for word in words:
-        if len(word) <= 2:
-            corrected_words.append(word)
-            continue
-
-        closest_term = None
-        min_distance = float('inf')
-
-        for term in common_terms:
-            distance = Levenshtein.distance(word, term.lower())
-            if distance < min(3, len(word) // 2) and distance < min_distance:
-                min_distance = distance
-                closest_term = term
-
-        if closest_term:
-            corrected_words.append(closest_term)
-        else:
-            correction = spell.correction(word)
-            corrected_words.append(correction if correction else word)
-
-    return ' '.join(corrected_words)
-
 
 def get_common_food_terms():
     """Fetch and cache common food terms from Elasticsearch, refreshing every hour."""
@@ -169,8 +138,9 @@ def correct_typos(query):
 
     return ' '.join(corrected_words)
 
+
 def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=False, has_cooktime=False):
-    """Search Elasticsearch with enhanced scoring based on ratings and review counts."""
+    """Execute Elasticsearch query with proper result cleaning."""
     from_val = (page - 1) * size
 
     search_body = {
@@ -185,25 +155,18 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
                             {"match": {"RecipeIngredientParts": {"query": query, "boost": 2.0}}},
                             {"match": {"RecipeInstructions": {"query": query, "boost": 1.5}}},
                             {"match": {"Description": {"query": query, "boost": 1.0}}},
-                            {"match": {"Keywords": {"query": query, "boost": 1.0}}},
-                            {"match": {"Name": {"query": query, "fuzziness": "AUTO", "boost": 1.0}}},
-                            {"match": {"RecipeIngredientParts": {"query": query, "fuzziness": "AUTO", "boost": 0.8}}}
+                            {"match": {"Keywords": {"query": query, "boost": 1.0}}}
                         ],
-                        "minimum_should_match": 1,
                         "filter": []
                     }
                 },
                 "script_score": {
                     "script": {
                         "source": """
-                            double rating_factor = 1.0;
-                            if (doc['AggregatedRating'].size() > 0 && doc['AggregatedRating'].value > 0) {
-                                rating_factor = doc['AggregatedRating'].value / 5.0;
-                            }
-                            double review_factor = 1.0;
-                            if (doc['ReviewCount'].size() > 0) {
-                                review_factor = 1 + Math.log(1 + doc['ReviewCount'].value);
-                            }
+                            double rating_factor = doc['AggregatedRating'].size() > 0 ? 
+                                (doc['AggregatedRating'].value / 5.0) : 1.0;
+                            double review_factor = doc['ReviewCount'].size() > 0 ? 
+                                (1 + Math.log(1 + doc['ReviewCount'].value)) : 1.0;
                             return _score * rating_factor * review_factor;
                         """
                     }
@@ -222,43 +185,53 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
         }
     }
 
-    # Add filters based on parameters
+    # Add filters
+    filter_conditions = []
     if has_rating:
-        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "AggregatedRating"}})
+        filter_conditions.append({"exists": {"field": "AggregatedRating"}})
     if has_image:
-        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "Images"}})
+        filter_conditions.append({"exists": {"field": "Images"}})
     if has_cooktime:
-        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "CookTime"}})
+        filter_conditions.append({"exists": {"field": "CookTime"}})
 
-    result = es_client.search(index="recipes", body=search_body)
-    total_hits = result["hits"]["total"]["value"]
-    hits = []
+    if filter_conditions:
+        search_body["query"]["function_score"]["query"]["bool"]["filter"] = filter_conditions
 
-    for hit in result["hits"]["hits"]:
-        source = hit["_source"]
-        score = hit["_score"]
-        highlights = hit.get("highlight", {})
+    try:
+        result = es_client.search(index="recipes", body=search_body)
+        total_hits = result["hits"]["total"]["value"]
+        hits = []
 
-        recipe = {
-            "id": hit["_id"],
-            "name": source.get("Name"),
-            "description": (source.get("Description", "")[:150] + "...") if source.get("Description") else "",
-            "image": source.get("Images", ["https://example.com/default-image.jpg"])[0],
-            "rating": source.get("AggregatedRating", 0.0),
-            "reviewCount": source.get("ReviewCount", 0),
-            "cookTime": source.get("CookTime", "Not Specified"),
-            "ingredients": source.get("RecipeIngredientParts", []),
-            "highlights": highlights,
-            "score": score,
-            "category": source.get("RecipeCategory"),
-            "yield": source.get("RecipeYield", "Unknown")
-        }
+        for hit in result["hits"]["hits"]:
+            source = hit["_source"]
+            score = hit["_score"]  # Get the raw score
+            highlights = hit.get("highlight", {})
 
-        cleaned_recipe = clean_result(recipe)
-        cleaned_recipe['ingredients'] = cleaned_recipe['ingredients'][:5]
-        hits.append(cleaned_recipe)
+            recipe = {
+                "id": hit["_id"],
+                "name": source.get("Name"),
+                "description": (source.get("Description", "")[:150] + "...") if source.get("Description") else "",
+                "image": source.get("Images", []),
+                "tags": source.get("Keywords", []),
+                "rating": source.get("AggregatedRating", 0.0),
+                "reviewCount": source.get("ReviewCount", 0),
+                "cookTime": source.get("CookTime", "Not Specified"),
+                "ingredients": source.get("RecipeIngredientParts", []),
+                "highlights": highlights,
+                "score": round(score, 2),  # Keep and format the score
+                "category": source.get("RecipeCategory"),
+                "yield": source.get("RecipeYield", "Unknown")
+            }
 
-    return {"hits": hits, "total": total_hits}
+            cleaned_recipe = clean_result(recipe)
+            cleaned_recipe['ingredients'] = cleaned_recipe['ingredients'][:5]
+            hits.append(cleaned_recipe)
+
+        return {"hits": hits, "total": total_hits}
+
+    except Exception as e:
+        current_app.logger.error(f"Search error: {str(e)}")
+        return {"hits": [], "total": 0}
 
 @search_bp.route('/api/search', methods=['GET'])
 def search_recipes():
