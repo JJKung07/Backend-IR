@@ -3,6 +3,7 @@ from flask_cors import CORS
 from auth import auth_bp
 from search import search_bp
 from recipes import recipes_bp
+from user import user_bp
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})  # Secure CORS configuration
@@ -11,6 +12,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})  # Secure CORS configuration
 app.register_blueprint(auth_bp)
 app.register_blueprint(search_bp)
 app.register_blueprint(recipes_bp)
+app.register_blueprint(user_bp)
 
 if __name__ == '__main__':
     app.run(debug=True)

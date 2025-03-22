@@ -1,41 +1,31 @@
 # recipes.py
 import csv
 from io import StringIO
-
 from flask import Blueprint, jsonify
 import sqlite3
 from pathlib import Path
 
 recipes_bp = Blueprint('recipes', __name__, url_prefix='/api')
 
-# Fixed typo in path (changed 'Resources' to 'resources')
 DB_PATH = 'Resources/db.db'
-
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def parse_r_vector(value):
     """Parse R-style vectors into proper Python lists"""
     if not value:
         return []
-
-    # Clean the R vector syntax
     cleaned = value.replace('c(', '').replace(')', '').strip()
     if not cleaned:
         return []
-
-    # Use CSV reader to handle quoted elements with commas
     reader = csv.reader(StringIO(cleaned), quotechar='"', skipinitialspace=True)
     try:
         items = next(reader)
     except StopIteration:
         items = []
-
-    # Clean and filter items
     return [item.strip().strip('"') for item in items if item.strip()]
 
 @recipes_bp.route('/recipes', methods=['GET'])
@@ -43,8 +33,6 @@ def get_recipes():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        # Modified query to get 10 latest recipes
         cursor.execute('''
             SELECT RecipeId AS id, 
                    Name AS title,
@@ -55,38 +43,22 @@ def get_recipes():
             FROM recipes
             LIMIT 10
         ''')
-
         recipes = cursor.fetchall()
         conn.close()
 
         recipes_list = []
         for recipe in recipes:
             recipe_dict = dict(recipe)
-
-            # Convert strings to arrays
             for field in ['images', 'tags']:
-                if recipe_dict[field]:
-                    # Remove R-style vector formatting
-                    cleaned = recipe_dict[field].replace('c(', '').replace(')', '')
-                    items = [item.strip(' "') for item in cleaned.split(', ')]
-                    recipe_dict[field] = items
-                else:
-                    recipe_dict[field] = []
-
-            # Remove DatePublished if not needed in response
+                recipe_dict[field] = parse_r_vector(recipe_dict.get(field, ''))
             del recipe_dict['DatePublished']
-
             recipes_list.append(recipe_dict)
-
         return jsonify(recipes_list)
-
     except sqlite3.Error as e:
         return jsonify({'error': f'Database error: {str(e)}'}), 500
     except Exception as e:
         return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-
-# recipes.py
 @recipes_bp.route('/recipes/<int:recipe_id>', methods=['GET'])
 def get_recipe(recipe_id):
     try:
@@ -95,13 +67,9 @@ def get_recipe(recipe_id):
         cursor.execute('SELECT * FROM recipes WHERE RecipeId = ?', (recipe_id,))
         recipe = cursor.fetchone()
         conn.close()
-
         if not recipe:
             return jsonify({'error': 'Recipe not found'}), 404
-
         recipe_dict = dict(recipe)
-
-        # Process array fields
         array_fields = [
             'RecipeIngredientParts',
             'RecipeInstructions',
@@ -109,19 +77,14 @@ def get_recipe(recipe_id):
             'Images',
             'Keywords'
         ]
-
         for field in array_fields:
             recipe_dict[field] = parse_r_vector(recipe_dict.get(field, ''))
-
-        # Nutrition handling remains the same
         nutrition = {key: recipe_dict.pop(key) for key in [
             'Calories', 'FatContent', 'SaturatedFatContent',
             'CholesterolContent', 'SodiumContent', 'CarbohydrateContent',
             'FiberContent', 'SugarContent', 'ProteinContent'
         ]}
         recipe_dict['nutrition'] = nutrition
-
         return jsonify(recipe_dict)
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
