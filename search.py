@@ -3,6 +3,7 @@ import time
 import re
 import sqlite3
 import Levenshtein
+from collections import defaultdict
 from datetime import datetime, timedelta
 from spellchecker import SpellChecker
 from flask import Blueprint, request, jsonify, current_app
@@ -16,7 +17,7 @@ CORS(search_bp, resources={r"/api/*": {"origins": "*"}})
 es_client = Elasticsearch(
     "https://localhost:9200",
     basic_auth=("elastic", "w9WdF24qfMj8bHZtDBwj"),
-    ca_certs="D:\Java\IR\Project\Backend\http_ca.crt",
+    ca_certs="D:\\Java\\IR\\Project\\Backend\\http_ca.crt",
     request_timeout=30,
     verify_certs=True,
     ssl_show_warn=False,
@@ -27,8 +28,10 @@ es_client = Elasticsearch(
 # SQLite connection helper
 DB_PATH = 'resources/db5.db'
 
-# Global variables for caching common terms
+# Global variables for caching common terms and bigrams
 common_terms = []
+common_terms_dict = defaultdict(list)  # For faster lookup by first letter
+common_bigrams = set()  # Store bigrams from food terms
 last_updated = 0
 
 
@@ -70,16 +73,12 @@ def clean_result(result):
             return [html_pattern.sub('', item) for item in text]
         return html_pattern.sub('', str(text))
 
-    # Handle image arrays
     if 'image' in cleaned:
-        # Instead of simply taking the first element,
-        # use the clean_image_link function if the image is a list.
         if isinstance(cleaned['image'], list):
             cleaned['image'] = clean_image_link(cleaned['image'])
         else:
             cleaned['image'] = clean_image_link([cleaned['image']])
 
-    # Clean ingredients
     if 'ingredients' in cleaned:
         if isinstance(cleaned['ingredients'], str):
             cleaned['ingredients'] = parse_r_vector(cleaned['ingredients'])
@@ -87,7 +86,6 @@ def clean_result(result):
             cleaned['ingredients'] = parse_r_vector(' '.join(cleaned['ingredients']))
         cleaned['ingredients'] = remove_tags(cleaned['ingredients'])
 
-    # Clean highlights
     if 'highlights' in cleaned:
         highlights = cleaned['highlights']
         for field in list(highlights.keys()):
@@ -101,69 +99,177 @@ def clean_result(result):
 
 
 def get_common_food_terms():
-    """Fetch and cache common food terms from Elasticsearch, refreshing every hour."""
-    global common_terms, last_updated
-    if time.time() - last_updated > 3600:  # Refresh every hour
+    """Fetch and cache common food terms and bigrams from Elasticsearch, refreshing every hour."""
+    global common_terms, common_terms_dict, common_bigrams, last_updated
+    if time.time() - last_updated > 3600:
         try:
             ingredient_aggs = es_client.search(
                 index="recipes",
                 body={"size": 0,
-                      "aggs": {"ingredients": {"terms": {"field": "RecipeIngredientParts.keyword", "size": 1000}}}}
+                      "aggs": {"ingredients": {"terms": {"field": "RecipeIngredientParts.keyword", "size": 2000}}}}
             )
             keyword_aggs = es_client.search(
                 index="recipes",
-                body={"size": 0, "aggs": {"keywords": {"terms": {"field": "Keywords.keyword", "size": 1000}}}}
+                body={"size": 0, "aggs": {"keywords": {"terms": {"field": "Keywords.keyword", "size": 2000}}}}
             )
 
             ingredients = [bucket["key"] for bucket in ingredient_aggs["aggregations"]["ingredients"]["buckets"]]
             keywords = [bucket["key"] for bucket in keyword_aggs["aggregations"]["keywords"]["buckets"]]
 
             common_terms = set()
+            common_terms_dict = defaultdict(list)
+            common_bigrams = set()
+
             for term_list in [ingredients, keywords]:
                 for term in term_list:
-                    for word in term.split():
-                        if len(word) > 2:
-                            common_terms.add(word.lower())
+                    words = [w.strip().lower() for w in term.split() if len(w.strip()) > 2]
+                    for word in words:
+                        common_terms.add(word)
+                        common_terms_dict[word[0]].append(word)
+                    # Generate bigrams from consecutive words
+                    for i in range(len(words) - 1):
+                        bigram = f"{words[i]} {words[i + 1]}"
+                        common_bigrams.add(bigram)
             common_terms = list(common_terms)
             last_updated = time.time()
         except Exception as e:
             current_app.logger.error(f"Error updating common food terms: {str(e)}")
-    return common_terms
+            common_terms = []
+            common_terms_dict = defaultdict(list)
+            common_bigrams = set()
+    return common_terms_dict
 
 
 def correct_typos(query):
-    """Correct typos in the query using cached common food terms and a spell checker."""
-    spell = SpellChecker()
-    words = query.lower().split()
-    corrected_words = []
+    """Correct typos using bigrams and unigrams with food-specific logic and prefix support."""
+    spell = SpellChecker(distance=1)  # Faster with reduced distance
     common_terms_local = get_common_food_terms()
 
-    for word in words:
-        if len(word) <= 2:
-            corrected_words.append(word)
+    corrected_parts = {"Name": [], "RecipeIngredientParts": [], "RecipeInstructions": []}
+    words = query.lower().split()
+    i = 0
+
+    while i < len(words):
+        # Try bigram correction first
+        if i < len(words) - 1:
+            bigram = f"{words[i]} {words[i + 1]}"
+            prefix1, term1 = (words[i], words[i][4:]) if words[i].startswith("ing:") or words[i].startswith(
+                "cook:") else (None, words[i])
+            prefix2, term2 = (words[i + 1], words[i + 1][4:]) if words[i + 1].startswith("ing:") or words[
+                i + 1].startswith("cook:") else (None, words[i + 1])
+            bigram_term = f"{term1} {term2}"
+
+            # Determine target based on prefixes (use first word's prefix if present)
+            if prefix1 == "ing:" or prefix2 == "ing:":
+                target = "RecipeIngredientParts"
+                prefix = "ing:"
+            elif prefix1 == "cook:" or prefix2 == "cook:":
+                target = "RecipeInstructions"
+                prefix = "cook:"
+            else:
+                target = "Name"
+                prefix = None
+
+            # Check if bigram needs correction
+            if len(term1) > 2 and len(term2) > 2 and bigram_term not in common_bigrams:
+                closest_bigram = None
+                min_distance = min(5, (len(term1) + len(term2)) // 2)  # Adjusted for bigram length
+
+                for correct_bigram in common_bigrams:
+                    distance = Levenshtein.distance(bigram_term, correct_bigram)
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_bigram = correct_bigram
+
+                if closest_bigram:
+                    word1, word2 = closest_bigram.split()
+                    corrected_parts[target].append(f"{prefix}{word1}" if prefix else word1)
+                    corrected_parts[target].append(f"{prefix}{word2}" if prefix and not prefix2 else word2)
+                    i += 2  # Skip next word since we processed a bigram
+                    continue
+
+        # Fallback to unigram correction
+        word = words[i]
+        prefix = None
+        term = word
+        if word.startswith("ing:"):
+            prefix = "ing:"
+            term = word[4:]
+            target = "RecipeIngredientParts"
+        elif word.startswith("cook:"):
+            prefix = "cook:"
+            term = word[5:]
+            target = "RecipeInstructions"
+        else:
+            target = "Name"
+
+        if len(term) <= 2:
+            corrected_parts[target].append(word)
+            i += 1
             continue
 
         closest_term = None
-        min_distance = float('inf')
+        min_distance = min(3, len(term) // 2)
+        candidates = common_terms_local.get(term[0], [])
 
-        for term in common_terms_local:
-            distance = Levenshtein.distance(word, term.lower())
-            if distance < min(3, len(word) // 2) and distance < min_distance:
+        for candidate in candidates:
+            distance = Levenshtein.distance(term, candidate)
+            if distance < min_distance:
                 min_distance = distance
-                closest_term = term
+                closest_term = candidate
 
         if closest_term:
-            corrected_words.append(closest_term)
+            corrected_term = f"{prefix}{closest_term}" if prefix else closest_term
+            corrected_parts[target].append(corrected_term)
         else:
-            correction = spell.correction(word)
-            corrected_words.append(correction if correction else word)
+            correction = spell.correction(term)
+            if correction and Levenshtein.distance(term, correction) <= 2:
+                corrected_term = f"{prefix}{correction}" if prefix else correction
+            else:
+                corrected_term = word
+            corrected_parts[target].append(corrected_term)
+        i += 1
 
-    return ' '.join(corrected_words)
+    corrected_query = " ".join(
+        corrected_parts["Name"] + corrected_parts["RecipeIngredientParts"] + corrected_parts["RecipeInstructions"]
+    )
+    return corrected_query if corrected_query != query.lower() else query
+
+
+def parse_query(query):
+    """Parse the query into components for Name, Ingredients, and Instructions."""
+    terms = {
+        "Name": [],
+        "RecipeIngredientParts": [],
+        "RecipeInstructions": []
+    }
+
+    for word in query.split():
+        if word.startswith("ing:"):
+            terms["RecipeIngredientParts"].append(word[4:])
+        elif word.startswith("cook:"):
+            terms["RecipeInstructions"].append(word[5:])
+        else:
+            terms["Name"].append(word)
+
+    return {
+        "Name": " ".join(terms["Name"]),
+        "RecipeIngredientParts": " ".join(terms["RecipeIngredientParts"]),
+        "RecipeInstructions": " ".join(terms["RecipeInstructions"])
+    }
 
 
 def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=False, has_cooktime=False):
-    """Search Elasticsearch with enhanced scoring based on ratings and review counts."""
+    """Search Elasticsearch with enhanced scoring and field-specific emphasis."""
     from_val = (page - 1) * size
+
+    parsed_query = parse_query(query)
+    name_query = parsed_query["Name"]
+    ingredient_query = parsed_query["RecipeIngredientParts"]
+    instruction_query = parsed_query["RecipeInstructions"]
+
+    base_boosts = {"Name": 3.0, "RecipeIngredientParts": 2.0, "RecipeInstructions": 1.5}
+    emphasis_boost = 2.0
 
     search_body = {
         "from": from_val,
@@ -172,15 +278,7 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
             "function_score": {
                 "query": {
                     "bool": {
-                        "should": [
-                            {"match": {"Name": {"query": query, "boost": 3.0}}},
-                            {"match": {"RecipeIngredientParts": {"query": query, "boost": 2.0}}},
-                            {"match": {"RecipeInstructions": {"query": query, "boost": 1.5}}},
-                            {"match": {"Description": {"query": query, "boost": 1.0}}},
-                            {"match": {"Keywords": {"query": query, "boost": 1.0}}},
-                            {"match": {"Name": {"query": query, "fuzziness": "AUTO", "boost": 1.0}}},
-                            {"match": {"RecipeIngredientParts": {"query": query, "fuzziness": "AUTO", "boost": 0.8}}}
-                        ],
+                        "should": [],
                         "minimum_should_match": 1,
                         "filter": []
                     }
@@ -214,7 +312,38 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
         }
     }
 
-    # Add filters based on parameters
+    should_clauses = search_body["query"]["function_score"]["query"]["bool"]["should"]
+
+    if name_query:
+        should_clauses.extend([
+            {"match": {"Name": {"query": name_query, "boost": base_boosts["Name"]}}},
+            {"match": {"Name": {"query": name_query, "fuzziness": "AUTO", "boost": 1.0}}}
+        ])
+
+    if ingredient_query:
+        boost = base_boosts["RecipeIngredientParts"] * emphasis_boost
+        should_clauses.extend([
+            {"match": {"RecipeIngredientParts": {"query": ingredient_query, "boost": boost}}},
+            {"match": {"RecipeIngredientParts": {"query": ingredient_query, "fuzziness": "AUTO", "boost": 0.8}}}
+        ])
+
+    if instruction_query:
+        boost = base_boosts["RecipeInstructions"] * emphasis_boost
+        should_clauses.append(
+            {"match": {"RecipeInstructions": {"query": instruction_query, "boost": boost}}}
+        )
+
+    if not (name_query or ingredient_query or instruction_query):
+        should_clauses.extend([
+            {"match": {"Name": {"query": query, "boost": base_boosts["Name"]}}},
+            {"match": {"RecipeIngredientParts": {"query": query, "boost": base_boosts["RecipeIngredientParts"]}}},
+            {"match": {"RecipeInstructions": {"query": query, "boost": base_boosts["RecipeInstructions"]}}},
+            {"match": {"Description": {"query": query, "boost": 1.0}}},
+            {"match": {"Keywords": {"query": query, "boost": 1.0}}},
+            {"match": {"Name": {"query": query, "fuzziness": "AUTO", "boost": 1.0}}},
+            {"match": {"RecipeIngredientParts": {"query": query, "fuzziness": "AUTO", "boost": 0.8}}}
+        ])
+
     if has_rating:
         search_body["query"]["function_score"]["query"]["bool"]["filter"].append(
             {"exists": {"field": "AggregatedRating"}})
@@ -268,17 +397,13 @@ def search_recipes():
         return jsonify({'error': 'Search query is required'}), 400
 
     original_query = query
-    corrected_query = None
-
-    if len(query) > 2:
-        corrected_query = correct_typos(query)
-        if corrected_query and corrected_query == query:
-            corrected_query = None
+    corrected_query = correct_typos(query) if len(query) > 2 else query
 
     try:
-        search_results = search_in_elasticsearch(query, page, size, has_rating, has_image, has_cooktime)
+        search_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image, has_cooktime)
+        parsed_query = parse_query(corrected_query)
 
-        if corrected_query and (search_results['total'] < 3):
+        if corrected_query != original_query and (search_results['total'] < 3):
             corrected_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image,
                                                         has_cooktime)
             return jsonify({
@@ -286,6 +411,7 @@ def search_recipes():
                 'total': search_results['total'],
                 'page': page,
                 'size': size,
+                'parsed_query': parsed_query,
                 'suggestion': {
                     'text': corrected_query,
                     'results': corrected_results['hits'],
@@ -298,7 +424,8 @@ def search_recipes():
             'total': search_results['total'],
             'page': page,
             'size': size,
-            'suggestion': {'text': corrected_query} if corrected_query else None
+            'parsed_query': parsed_query,
+            'suggestion': {'text': corrected_query} if corrected_query != original_query else None
         }), 200
 
     except Exception as e:
