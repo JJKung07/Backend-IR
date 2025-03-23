@@ -1,6 +1,5 @@
 # user.py
 import random
-
 from flask import Blueprint, request, jsonify
 import sqlite3
 import csv
@@ -25,18 +24,28 @@ def parse_r_vector(value):
         items = []
     return [item.strip().strip('"') for item in items if item.strip()]
 
-
 @user_bp.route('/api/user/folders', methods=['GET'])
 @token_required
 def get_folders(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('SELECT FolderId, Name FROM folders WHERE user_id = ?', (user_id,))
+    # Fetch folders with average rating
+    cursor.execute('''
+        SELECT f.FolderId, f.Name, AVG(b.Rating) as avg_rating
+        FROM folders f
+        LEFT JOIN bookmarks b ON f.FolderId = b.FolderId
+        WHERE f.user_id = ?
+        GROUP BY f.FolderId, f.Name
+    ''', (user_id,))
     folders = cursor.fetchall()
     conn.close()
-    folders_list = [{'id': row[0], 'name': row[1]} for row in folders]
+    folders_list = [
+        {'id': row[0], 'name': row[1], 'avg_rating': row[2] if row[2] is not None else 0}
+        for row in folders
+    ]
+    # Sort folders by avg_rating in descending order
+    folders_list.sort(key=lambda x: x['avg_rating'], reverse=True)
     return jsonify(folders_list)
-
 
 @user_bp.route('/api/user/folders', methods=['POST'])
 @token_required
@@ -57,7 +66,6 @@ def create_folder(user_id):
     finally:
         conn.close()
 
-
 @user_bp.route('/api/user/folders/<int:folder_id>', methods=['DELETE'])
 @token_required
 def delete_folder(user_id, folder_id):
@@ -73,7 +81,6 @@ def delete_folder(user_id, folder_id):
     conn.commit()
     conn.close()
     return jsonify({'message': 'Folder deleted successfully'}), 200
-
 
 @user_bp.route('/api/user/folders/<int:folder_id>', methods=['PUT'])
 @token_required
@@ -93,7 +100,6 @@ def update_folder(user_id, folder_id):
     conn.commit()
     conn.close()
     return jsonify({'id': folder_id, 'name': new_name}), 200
-
 
 @user_bp.route('/api/user/bookmarks', methods=['POST'])
 @token_required
@@ -132,14 +138,15 @@ def create_bookmark(user_id):
     finally:
         conn.close()
 
-
 @user_bp.route('/api/user/bookmarks', methods=['GET'])
 @token_required
 def get_bookmarks(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    # Fetch bookmarks with folder details and calculate average rating
     cursor.execute('''
-        SELECT b.FolderId, f.Name, b.RecipeId, r.Name, r.Images, b.Rating
+        SELECT b.FolderId, f.Name, b.RecipeId, r.Name, r.Images, b.Rating,
+               AVG(b.Rating) OVER (PARTITION BY b.FolderId) as avg_folder_rating
         FROM bookmarks b
         JOIN folders f ON b.FolderId = f.FolderId
         JOIN recipes r ON b.RecipeId = r.RecipeId
@@ -147,25 +154,36 @@ def get_bookmarks(user_id):
     ''', (user_id,))
     bookmarks = cursor.fetchall()
     conn.close()
-    folders = {}
+
+    # Organize bookmarks into folders
+    folders_dict = {}
     for bm in bookmarks:
         folder_id = bm[0]
-        if folder_id not in folders:
-            folders[folder_id] = {
+        if folder_id not in folders_dict:
+            folders_dict[folder_id] = {
                 'folderId': folder_id,
                 'folderName': bm[1],
-                'bookmarks': []
+                'bookmarks': [],
+                'avg_rating': bm[6] if bm[6] is not None else 0  # Average rating for the folder
             }
         images_list = parse_r_vector(bm[4])
         image = images_list[0] if images_list and images_list[0] != 'character(0)' else None
-        folders[folder_id]['bookmarks'].append({
+        folders_dict[folder_id]['bookmarks'].append({
             'recipeId': bm[2],
             'recipeName': bm[3],
             'image': image,
-            'rating': bm[5]
+            'rating': bm[5] if bm[5] is not None else 0  # Default to 0 if no rating
         })
-    return jsonify(list(folders.values()))
 
+    # Convert to list and sort bookmarks within each folder by rating
+    folders_list = list(folders_dict.values())
+    for folder in folders_list:
+        folder['bookmarks'].sort(key=lambda x: x['rating'], reverse=True)
+
+    # Sort folders by average rating (descending)
+    folders_list.sort(key=lambda x: x['avg_rating'], reverse=True)
+
+    return jsonify(folders_list)
 
 @user_bp.route('/api/user/bookmarks/<int:folder_id>/<int:recipe_id>', methods=['PUT'])
 @token_required
@@ -200,7 +218,6 @@ def update_bookmark(user_id, folder_id, recipe_id):
     conn.close()
 
     return jsonify({'message': 'Bookmark rating updated successfully'}), 200
-
 
 @user_bp.route('/api/user/bookmarks/<int:folder_id>/<int:recipe_id>', methods=['DELETE'])
 @token_required
@@ -249,7 +266,6 @@ def get_recommendations_for_folder(folder_id):
     conn.close()
     return recommendation_ids
 
-
 @user_bp.route('/api/user/folders/<int:folder_id>/suggestions', methods=['GET'])
 @token_required
 def get_suggestions(user_id, folder_id):
@@ -292,9 +308,6 @@ def get_suggestions(user_id, folder_id):
             recipe_dict[field] = parse_r_vector(recipe_dict.get(field, ''))
         recipes_list.append(recipe_dict)
     return jsonify(recipes_list)
-
-
-# user.py
 
 @user_bp.route('/api/user/recommendations', methods=['GET'])
 @token_required
