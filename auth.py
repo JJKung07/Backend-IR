@@ -10,7 +10,7 @@ auth_bp = Blueprint('auth', __name__)
 CORS(auth_bp, resources={r"/api/*": {"origins": "*"}})
 
 # Configuration
-SECRET_KEY = '56d06939523008f63729b436b6872a7b017b1a6389fbf16f2d98d828471ce5e2'  # Change this in production
+SECRET_KEY = 'KEY'  # Change this in production
 JWT_EXPIRATION_DELTA = 24 * 60 * 60  # 24 hours in seconds
 DB_PATH = 'Resources/db5.db'
 

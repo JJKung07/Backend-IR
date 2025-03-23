@@ -16,8 +16,8 @@ CORS(search_bp, resources={r"/api/*": {"origins": "*"}})
 # Configure Elasticsearch client
 es_client = Elasticsearch(
     "https://localhost:9200",
-    basic_auth=("elastic", "w9WdF24qfMj8bHZtDBwj"),
-    ca_certs="D:\\Java\\IR\\Project\\Backend\\http_ca.crt",
+    basic_auth=("elastic", "KEY"),
+    ca_certs="PATH_TO_http_ca",
     request_timeout=30,
     verify_certs=True,
     ssl_show_warn=False,
