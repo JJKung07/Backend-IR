@@ -46,6 +46,27 @@ def parse_r_vector(text):
     return matches if matches else [text]
 
 
+def clean_image_link(image_list):
+    """Join R-style vector parts into a single, clean URL that ends with .jpg.
+
+    If the result is 'character(0)' or empty, returns an empty string to signal no image.
+    """
+    if not image_list:
+        return ""
+    # Join parts with commas and strip extra spaces
+    joined = ",".join(part.strip() for part in image_list)
+    # Remove leading 'c("', trailing '")', and any extra quotes
+    joined = joined.replace('c("', '').replace('")', '').replace('"', '')
+    # Extract substring up to (and including) the first '.jpg'
+    jpg_index = joined.find('.jpg')
+    if jpg_index != -1:
+        joined = joined[:jpg_index + 4]
+    # If the cleaned result equals "character(0)" or is empty, return empty string
+    if joined == "character(0)" or not joined:
+        return ""
+    return joined
+
+
 def clean_result(result):
     """Clean R-style vectors and HTML tags from Elasticsearch results"""
     cleaned = result.copy()
@@ -57,8 +78,13 @@ def clean_result(result):
         return html_pattern.sub('', str(text))
 
     # Handle image arrays
-    if 'image' in cleaned and isinstance(cleaned['image'], list):
-        cleaned['image'] = cleaned['image'][0] if cleaned['image'] else None
+    if 'image' in cleaned:
+        # Instead of simply taking the first element,
+        # use the clean_image_link function if the image is a list.
+        if isinstance(cleaned['image'], list):
+            cleaned['image'] = clean_image_link(cleaned['image'])
+        else:
+            cleaned['image'] = clean_image_link([cleaned['image']])
 
     # Clean ingredients
     if 'ingredients' in cleaned:
@@ -79,35 +105,6 @@ def clean_result(result):
                 highlights[field] = parsed
 
     return cleaned
-
-
-def correct_typos(query):
-    spell = SpellChecker()
-    words = query.lower().split()
-    corrected_words = []
-    common_terms = get_common_food_terms()
-
-    for word in words:
-        if len(word) <= 2:
-            corrected_words.append(word)
-            continue
-
-        closest_term = None
-        min_distance = float('inf')
-
-        for term in common_terms:
-            distance = Levenshtein.distance(word, term.lower())
-            if distance < min(3, len(word) // 2) and distance < min_distance:
-                min_distance = distance
-                closest_term = term
-
-        if closest_term:
-            corrected_words.append(closest_term)
-        else:
-            correction = spell.correction(word)
-            corrected_words.append(correction if correction else word)
-
-    return ' '.join(corrected_words)
 
 
 def get_common_food_terms():
@@ -140,12 +137,13 @@ def get_common_food_terms():
             current_app.logger.error(f"Error updating common food terms: {str(e)}")
     return common_terms
 
+
 def correct_typos(query):
     """Correct typos in the query using cached common food terms and a spell checker."""
     spell = SpellChecker()
     words = query.lower().split()
     corrected_words = []
-    common_terms = get_common_food_terms()
+    common_terms_local = get_common_food_terms()
 
     for word in words:
         if len(word) <= 2:
@@ -155,7 +153,7 @@ def correct_typos(query):
         closest_term = None
         min_distance = float('inf')
 
-        for term in common_terms:
+        for term in common_terms_local:
             distance = Levenshtein.distance(word, term.lower())
             if distance < min(3, len(word) // 2) and distance < min_distance:
                 min_distance = distance
@@ -168,6 +166,7 @@ def correct_typos(query):
             corrected_words.append(correction if correction else word)
 
     return ' '.join(corrected_words)
+
 
 def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=False, has_cooktime=False):
     """Search Elasticsearch with enhanced scoring based on ratings and review counts."""
@@ -224,7 +223,8 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
 
     # Add filters based on parameters
     if has_rating:
-        search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "AggregatedRating"}})
+        search_body["query"]["function_score"]["query"]["bool"]["filter"].append(
+            {"exists": {"field": "AggregatedRating"}})
     if has_image:
         search_body["query"]["function_score"]["query"]["bool"]["filter"].append({"exists": {"field": "Images"}})
     if has_cooktime:
@@ -243,7 +243,7 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
             "id": hit["_id"],
             "name": source.get("Name"),
             "description": (source.get("Description", "")[:150] + "...") if source.get("Description") else "",
-            "image": source.get("Images", ["https://example.com/default-image.jpg"])[0],
+            "image": clean_image_link(source.get("Images", [])),
             "rating": source.get("AggregatedRating", 0.0),
             "reviewCount": source.get("ReviewCount", 0),
             "cookTime": source.get("CookTime", "Not Specified"),
@@ -259,6 +259,7 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
         hits.append(cleaned_recipe)
 
     return {"hits": hits, "total": total_hits}
+
 
 @search_bp.route('/api/search', methods=['GET'])
 def search_recipes():
@@ -285,7 +286,8 @@ def search_recipes():
         search_results = search_in_elasticsearch(query, page, size, has_rating, has_image, has_cooktime)
 
         if corrected_query and (search_results['total'] < 3):
-            corrected_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image, has_cooktime)
+            corrected_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image,
+                                                        has_cooktime)
             return jsonify({
                 'results': search_results['hits'],
                 'total': search_results['total'],
@@ -309,6 +311,7 @@ def search_recipes():
     except Exception as e:
         current_app.logger.error(f"Search error: {str(e)}")
         return jsonify({'error': 'An error occurred during search'}), 500
+
 
 def setup_elasticsearch_index():
     """Set up the Elasticsearch index with mappings and settings."""
@@ -374,6 +377,7 @@ def setup_elasticsearch_index():
     es_client.indices.create(index=index_name, body=mapping)
     print("Elasticsearch index 'recipes' created.")
 
+
 def index_recipes_from_sqlite():
     """
     Fetch recipes from SQLite database and index them in Elasticsearch.
@@ -427,10 +431,12 @@ def index_recipes_from_sqlite():
                     recipe_dict['DatePublished'] = dt.strftime("%Y-%m-%d")
                 except ValueError:
                     try:
-                        dt = datetime.strptime(recipe_dict['DatePublished'], "%Y-%m-%d %H:%M:%S")  # e.g., "2025-03-23 12:00:00"
+                        dt = datetime.strptime(recipe_dict['DatePublished'],
+                                               "%Y-%m-%d %H:%M:%S")  # e.g., "2025-03-23 12:00:00"
                         recipe_dict['DatePublished'] = dt.strftime("%Y-%m-%d")
                     except ValueError:
-                        print(f"Warning: Invalid date for Recipe ID {recipe_dict['RecipeId']}: {recipe_dict['DatePublished']}")
+                        print(
+                            f"Warning: Invalid date for Recipe ID {recipe_dict['RecipeId']}: {recipe_dict['DatePublished']}")
                         recipe_dict['DatePublished'] = None  # Set to None if unparseable
 
             # Split comma-separated fields safely
@@ -445,7 +451,8 @@ def index_recipes_from_sqlite():
                 try:
                     recipe_dict['ReviewCount'] = int(float(recipe_dict['ReviewCount']))  # REAL to int
                 except ValueError:
-                    print(f"Warning: Invalid ReviewCount for Recipe ID {recipe_dict['RecipeId']}: {recipe_dict['ReviewCount']}")
+                    print(
+                        f"Warning: Invalid ReviewCount for Recipe ID {recipe_dict['RecipeId']}: {recipe_dict['ReviewCount']}")
                     recipe_dict['ReviewCount'] = 0  # Default to 0 if invalid
 
             # Add to bulk data
@@ -464,7 +471,8 @@ def index_recipes_from_sqlite():
             else:
                 stats = es_client.cat.indices(index="recipes", format="json")
                 doc_count = stats[0]['docs.count'] if stats else "unknown"
-                print(f"Indexed batch {batch_num + 1}/{total_batches} ({len(recipes)} recipes), Total docs: {doc_count}")
+                print(
+                    f"Indexed batch {batch_num + 1}/{total_batches} ({len(recipes)} recipes), Total docs: {doc_count}")
 
     conn.close()
     print(f"Completed indexing {total_recipes} recipes")
@@ -491,7 +499,9 @@ def get_indexes():
         current_app.logger.error(f"Failed to retrieve indexes: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+
 import click
+
 
 @click.command("index-recipes")
 def index_recipes_command():
@@ -501,9 +511,11 @@ def index_recipes_command():
     elapsed_time = time.time() - start_time
     print(f"Indexing completed in {elapsed_time:.2f} seconds")
 
+
 def register_commands(app):
     """Register CLI commands with the Flask app."""
     app.cli.add_command(index_recipes_command)
+
 
 # Debug endpoint for troubleshooting
 @search_bp.route('/api/debug/recipe/<recipe_id>', methods=['GET'])
