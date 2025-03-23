@@ -47,21 +47,14 @@ def parse_r_vector(text):
 
 
 def clean_image_link(image_list):
-    """Join R-style vector parts into a single, clean URL that ends with .jpg.
-
-    If the result is 'character(0)' or empty, returns an empty string to signal no image.
-    """
     if not image_list:
         return ""
-    # Join parts with commas and strip extra spaces
     joined = ",".join(part.strip() for part in image_list)
-    # Remove leading 'c("', trailing '")', and any extra quotes
     joined = joined.replace('c("', '').replace('")', '').replace('"', '')
-    # Extract substring up to (and including) the first '.jpg'
-    jpg_index = joined.find('.jpg')
+    lower_joined = joined.lower()
+    jpg_index = lower_joined.find('.jpg')
     if jpg_index != -1:
         joined = joined[:jpg_index + 4]
-    # If the cleaned result equals "character(0)" or is empty, return empty string
     if joined == "character(0)" or not joined:
         return ""
     return joined
