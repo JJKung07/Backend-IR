@@ -1,9 +1,7 @@
-# recipes.py
 import csv
 from io import StringIO
 from flask import Blueprint, jsonify
 import sqlite3
-from pathlib import Path
 
 recipes_bp = Blueprint('recipes', __name__, url_prefix='/api')
 

@@ -2,9 +2,9 @@ import pandas as pd
 import sqlite3
 
 # Configuration
-DB_PATH = 'resoures/db.db'
-RECIPES_CSV = 'resoures/recipes.csv'
-REVIEWS_CSV = 'resoures/reviews.csv'
+DB_PATH = 'Resources/db5.db'
+RECIPES_CSV = 'Resources/recipes.csv'
+REVIEWS_CSV = 'Resources/reviews.csv'
 CHUNKSIZE = 50000
 
 

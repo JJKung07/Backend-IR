@@ -1,4 +1,3 @@
-# user.py
 import random
 from flask import Blueprint, request, jsonify
 import sqlite3
@@ -11,7 +10,6 @@ user_bp = Blueprint('user', __name__)
 DB_PATH = 'Resources/db5.db'
 
 def parse_r_vector(value):
-    """Parse R-style vectors into proper Python lists"""
     if not value:
         return []
     cleaned = value.replace('c(', '').replace(')', '').strip()
@@ -262,7 +260,7 @@ def get_recommendations_for_folder(folder_id):
     cursor.execute(f'SELECT RecipeId FROM recipes WHERE RecipeId NOT IN ({placeholders})', bookmarked_ids)
     all_ids = [row[0] for row in cursor.fetchall()]
     # Select up to 5 random recipe IDs as placeholder recommendations
-    recommendation_ids = random.sample(all_ids, min(5, len(all_ids))) if all_ids else []
+    recommendation_ids = random.sample(all_ids, min(6, len(all_ids))) if all_ids else []
     conn.close()
     return recommendation_ids
 

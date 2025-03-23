@@ -1,4 +1,4 @@
-import os
+import click
 import time
 import re
 import sqlite3
@@ -25,7 +25,6 @@ es_client = Elasticsearch(
     retry_on_timeout=True
 )
 
-# SQLite connection helper
 DB_PATH = 'resources/db5.db'
 
 # Global variables for caching common terms and bigrams
@@ -42,7 +41,6 @@ def get_db_connection():
 
 
 def parse_r_vector(text):
-    """Parse R-style vector strings into Python lists."""
     if not text:
         return []
     matches = re.findall(r'"([^"]*)"', text)
@@ -64,7 +62,6 @@ def clean_image_link(image_list):
 
 
 def clean_result(result):
-    """Clean R-style vectors and HTML tags from Elasticsearch results"""
     cleaned = result.copy()
     html_pattern = re.compile(r'<[^>]+>')
 
@@ -99,7 +96,6 @@ def clean_result(result):
 
 
 def get_common_food_terms():
-    """Fetch and cache common food terms and bigrams from Elasticsearch, refreshing every hour."""
     global common_terms, common_terms_dict, common_bigrams, last_updated
     if time.time() - last_updated > 3600:
         try:
@@ -141,7 +137,6 @@ def get_common_food_terms():
 
 
 def correct_typos(query):
-    """Correct typos using bigrams and unigrams with food-specific logic and prefix support."""
     spell = SpellChecker(distance=1)  # Faster with reduced distance
     common_terms_local = get_common_food_terms()
 
@@ -237,7 +232,6 @@ def correct_typos(query):
 
 
 def parse_query(query):
-    """Parse the query into components for Name, Ingredients, and Instructions."""
     terms = {
         "Name": [],
         "RecipeIngredientParts": [],
@@ -260,7 +254,6 @@ def parse_query(query):
 
 
 def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=False, has_cooktime=False):
-    """Search Elasticsearch with enhanced scoring and field-specific emphasis."""
     from_val = (page - 1) * size
 
     parsed_query = parse_query(query)
@@ -383,58 +376,7 @@ def search_in_elasticsearch(query, page=1, size=10, has_rating=False, has_image=
     return {"hits": hits, "total": total_hits}
 
 
-@search_bp.route('/api/search', methods=['GET'])
-def search_recipes():
-    """API endpoint to search for recipes."""
-    query = request.args.get('q', '')
-    page = int(request.args.get('page', 1))
-    size = int(request.args.get('size', 10))
-    has_rating = request.args.get('has_rating', 'false').lower() == 'true'
-    has_image = request.args.get('has_image', 'false').lower() == 'true'
-    has_cooktime = request.args.get('has_cooktime', 'false').lower() == 'true'
-
-    if not query:
-        return jsonify({'error': 'Search query is required'}), 400
-
-    original_query = query
-    corrected_query = correct_typos(query) if len(query) > 2 else query
-
-    try:
-        search_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image, has_cooktime)
-        parsed_query = parse_query(corrected_query)
-
-        if corrected_query != original_query and (search_results['total'] < 3):
-            corrected_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image,
-                                                        has_cooktime)
-            return jsonify({
-                'results': search_results['hits'],
-                'total': search_results['total'],
-                'page': page,
-                'size': size,
-                'parsed_query': parsed_query,
-                'suggestion': {
-                    'text': corrected_query,
-                    'results': corrected_results['hits'],
-                    'total': corrected_results['total']
-                }
-            }), 200
-
-        return jsonify({
-            'results': search_results['hits'],
-            'total': search_results['total'],
-            'page': page,
-            'size': size,
-            'parsed_query': parsed_query,
-            'suggestion': {'text': corrected_query} if corrected_query != original_query else None
-        }), 200
-
-    except Exception as e:
-        current_app.logger.error(f"Search error: {str(e)}")
-        return jsonify({'error': 'An error occurred during search'}), 500
-
-
 def setup_elasticsearch_index():
-    """Set up the Elasticsearch index with mappings and settings."""
     index_name = "recipes"
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
@@ -499,10 +441,6 @@ def setup_elasticsearch_index():
 
 
 def index_recipes_from_sqlite():
-    """
-    Fetch recipes from SQLite database and index them in Elasticsearch.
-    This can be run as a scheduled task or manually.
-    """
     # Check and setup the Elasticsearch index
     setup_elasticsearch_index()
 
@@ -597,10 +535,56 @@ def index_recipes_from_sqlite():
     conn.close()
     print(f"Completed indexing {total_recipes} recipes")
 
+@search_bp.route('/api/search', methods=['GET'])
+def search_recipes():
+    query = request.args.get('q', '')
+    page = int(request.args.get('page', 1))
+    size = int(request.args.get('size', 10))
+    has_rating = request.args.get('has_rating', 'false').lower() == 'true'
+    has_image = request.args.get('has_image', 'false').lower() == 'true'
+    has_cooktime = request.args.get('has_cooktime', 'false').lower() == 'true'
+
+    if not query:
+        return jsonify({'error': 'Search query is required'}), 400
+
+    original_query = query
+    corrected_query = correct_typos(query) if len(query) > 2 else query
+
+    try:
+        search_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image, has_cooktime)
+        parsed_query = parse_query(corrected_query)
+
+        if corrected_query != original_query and (search_results['total'] < 3):
+            corrected_results = search_in_elasticsearch(corrected_query, page, size, has_rating, has_image,
+                                                        has_cooktime)
+            return jsonify({
+                'results': search_results['hits'],
+                'total': search_results['total'],
+                'page': page,
+                'size': size,
+                'parsed_query': parsed_query,
+                'suggestion': {
+                    'text': corrected_query,
+                    'results': corrected_results['hits'],
+                    'total': corrected_results['total']
+                }
+            }), 200
+
+        return jsonify({
+            'results': search_results['hits'],
+            'total': search_results['total'],
+            'page': page,
+            'size': size,
+            'parsed_query': parsed_query,
+            'suggestion': {'text': corrected_query} if corrected_query != original_query else None
+        }), 200
+
+    except Exception as e:
+        current_app.logger.error(f"Search error: {str(e)}")
+        return jsonify({'error': 'An error occurred during search'}), 500
 
 @search_bp.route('/api/indexes', methods=['GET'])
 def get_indexes():
-    """API endpoint to list all Elasticsearch indexes."""
     try:
         response = es_client.cat.indices(format="json")
         if not response:
@@ -618,10 +602,6 @@ def get_indexes():
     except Exception as e:
         current_app.logger.error(f"Failed to retrieve indexes: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
-
-import click
-
 
 @click.command("index-recipes")
 def index_recipes_command():
