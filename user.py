@@ -302,13 +302,19 @@ def get_personalized_recommendations(user_id):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    folder_name_filter = request.args.get('folder_name', None)  # Optional query param
     try:
         # Get all bookmarked recipe IDs across all folders
         cursor.execute('SELECT DISTINCT RecipeId FROM bookmarks WHERE user_id = ?', (user_id,))
         all_bookmarked_ids = [row['RecipeId'] for row in cursor.fetchall()]
 
         # Get user's folders
-        cursor.execute('SELECT FolderId, Name FROM folders WHERE user_id = ?', (user_id,))
+        folder_query = 'SELECT FolderId, Name FROM folders WHERE user_id = ?'
+        if folder_name_filter:
+            folder_query += ' AND Name = ?'
+            cursor.execute(folder_query, (user_id, folder_name_filter))
+        else:
+            cursor.execute(folder_query, (user_id,))
         folders = cursor.fetchall()
         if not folders:
             return jsonify({'error': 'No folders found'}), 404
@@ -316,29 +322,25 @@ def get_personalized_recommendations(user_id):
         # Summary recommendations (from all bookmarks)
         summary_ids = random.sample(all_bookmarked_ids, min(6, len(all_bookmarked_ids))) if all_bookmarked_ids else []
 
-        # Random category recommendations
-        folder = random.choice(folders)
+        # Specific or random category recommendations
+        if folder_name_filter:
+            folder = folders[0]  # Assuming folder_name_filter matches exactly one
+        else:
+            folder = random.choice(folders)
         folder_id, folder_name = folder['FolderId'], folder['Name']
-        cursor.execute('''
-            SELECT RecipeId FROM bookmarks 
-            WHERE user_id = ? AND FolderId = ?
-        ''', (user_id, folder_id))
-        category_ids = [row['RecipeId'] for row in cursor.fetchall()]
+
+        # Fetch recommendations for this folder using existing function
+        category_ids = get_recommendations_for_folder(folder_id)
         category_ids = random.sample(category_ids, min(6, len(category_ids))) if category_ids else []
 
         # Random dishes (not in any folder)
         if all_bookmarked_ids:
             placeholders = ','.join(['?'] * len(all_bookmarked_ids))
-            query = f'''
-                SELECT RecipeId FROM recipes 
-                WHERE RecipeId NOT IN ({placeholders})
-                ORDER BY RANDOM() LIMIT 6
-            '''
+            query = f'SELECT RecipeId FROM recipes WHERE RecipeId NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT 6'
             cursor.execute(query, all_bookmarked_ids)
         else:
             query = 'SELECT RecipeId FROM recipes ORDER BY RANDOM() LIMIT 6'
             cursor.execute(query)
-
         random_ids = [row['RecipeId'] for row in cursor.fetchall()]
 
         # Fetch recipe details
@@ -367,8 +369,6 @@ def get_personalized_recommendations(user_id):
 
     except sqlite3.Error as e:
         return jsonify({'error': f'Database error: {str(e)}'}), 500
-    except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
     finally:
         conn.close()
 
