@@ -7,7 +7,7 @@ from pathlib import Path
 
 recipes_bp = Blueprint('recipes', __name__, url_prefix='/api')
 
-DB_PATH = 'Resources/db.db'
+DB_PATH = 'Resources/db5.db'
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -41,7 +41,7 @@ def get_recipes():
                    Images AS images,
                    DatePublished
             FROM recipes
-            LIMIT 10
+            LIMIT 6
         ''')
         recipes = cursor.fetchall()
         conn.close()

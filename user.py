@@ -9,6 +9,7 @@ from auth import token_required
 
 user_bp = Blueprint('user', __name__)
 
+DB_PATH = 'Resources/db5.db'
 
 def parse_r_vector(value):
     """Parse R-style vectors into proper Python lists"""
@@ -28,7 +29,7 @@ def parse_r_vector(value):
 @user_bp.route('/api/user/folders', methods=['GET'])
 @token_required
 def get_folders(user_id):
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT FolderId, Name FROM folders WHERE user_id = ?', (user_id,))
     folders = cursor.fetchall()
@@ -44,7 +45,7 @@ def create_folder(user_id):
     folder_name = data.get('name')
     if not folder_name:
         return jsonify({'error': 'Folder name is required'}), 400
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
         cursor.execute('INSERT INTO folders (user_id, Name) VALUES (?, ?)', (user_id, folder_name))
@@ -60,7 +61,7 @@ def create_folder(user_id):
 @user_bp.route('/api/user/folders/<int:folder_id>', methods=['DELETE'])
 @token_required
 def delete_folder(user_id, folder_id):
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM folders WHERE FolderId = ?', (folder_id,))
     folder = cursor.fetchone()
@@ -81,7 +82,7 @@ def update_folder(user_id, folder_id):
     new_name = data.get('name')
     if not new_name:
         return jsonify({'error': 'New folder name is required'}), 400
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM folders WHERE FolderId = ?', (folder_id,))
     folder = cursor.fetchone()
@@ -105,7 +106,7 @@ def create_bookmark(user_id):
         return jsonify({'error': 'folderId and recipeId are required'}), 400
     if rating and (rating < 1 or rating > 5):
         return jsonify({'error': 'Rating must be between 1 and 5'}), 400
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT user_id FROM folders WHERE FolderId = ?', (folder_id,))
     folder = cursor.fetchone()
@@ -135,7 +136,7 @@ def create_bookmark(user_id):
 @user_bp.route('/api/user/bookmarks', methods=['GET'])
 @token_required
 def get_bookmarks(user_id):
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         SELECT b.FolderId, f.Name, b.RecipeId, r.Name, r.Images, b.Rating
@@ -174,7 +175,7 @@ def update_bookmark(user_id, folder_id, recipe_id):
     if rating is None or not isinstance(rating, (int, float)) or rating < 1 or rating > 5:
         return jsonify({'error': 'Rating must be a number between 1 and 5'}), 400
 
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     # Verify ownership and existence
@@ -204,7 +205,7 @@ def update_bookmark(user_id, folder_id, recipe_id):
 @user_bp.route('/api/user/bookmarks/<int:folder_id>/<int:recipe_id>', methods=['DELETE'])
 @token_required
 def delete_bookmark(user_id, folder_id, recipe_id):
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     # Verify ownership and existence
@@ -231,7 +232,7 @@ def delete_bookmark(user_id, folder_id, recipe_id):
 
 def get_recommendations_for_folder(folder_id):
     """Placeholder function to generate a list of recommended recipe IDs."""
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     # Get recipe IDs already in the folder
     cursor.execute('SELECT RecipeId FROM bookmarks WHERE FolderId = ?', (folder_id,))
@@ -252,7 +253,7 @@ def get_recommendations_for_folder(folder_id):
 @user_bp.route('/api/user/folders/<int:folder_id>/suggestions', methods=['GET'])
 @token_required
 def get_suggestions(user_id, folder_id):
-    conn = sqlite3.connect('Resources/db.db')
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # Set row factory to return dict-like rows
     cursor = conn.cursor()
 
@@ -291,3 +292,89 @@ def get_suggestions(user_id, folder_id):
             recipe_dict[field] = parse_r_vector(recipe_dict.get(field, ''))
         recipes_list.append(recipe_dict)
     return jsonify(recipes_list)
+
+
+# user.py
+
+@user_bp.route('/api/user/recommendations', methods=['GET'])
+@token_required
+def get_personalized_recommendations(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        # Get all bookmarked recipe IDs across all folders
+        cursor.execute('SELECT DISTINCT RecipeId FROM bookmarks WHERE user_id = ?', (user_id,))
+        all_bookmarked_ids = [row['RecipeId'] for row in cursor.fetchall()]
+
+        # Get user's folders
+        cursor.execute('SELECT FolderId, Name FROM folders WHERE user_id = ?', (user_id,))
+        folders = cursor.fetchall()
+        if not folders:
+            return jsonify({'error': 'No folders found'}), 404
+
+        # Summary recommendations (from all bookmarks)
+        summary_ids = random.sample(all_bookmarked_ids, min(6, len(all_bookmarked_ids))) if all_bookmarked_ids else []
+
+        # Random category recommendations
+        folder = random.choice(folders)
+        folder_id, folder_name = folder['FolderId'], folder['Name']
+        cursor.execute('''
+            SELECT RecipeId FROM bookmarks 
+            WHERE user_id = ? AND FolderId = ?
+        ''', (user_id, folder_id))
+        category_ids = [row['RecipeId'] for row in cursor.fetchall()]
+        category_ids = random.sample(category_ids, min(6, len(category_ids))) if category_ids else []
+
+        # Random dishes (not in any folder)
+        if all_bookmarked_ids:
+            placeholders = ','.join(['?'] * len(all_bookmarked_ids))
+            query = f'''
+                SELECT RecipeId FROM recipes 
+                WHERE RecipeId NOT IN ({placeholders})
+                ORDER BY RANDOM() LIMIT 6
+            '''
+            cursor.execute(query, all_bookmarked_ids)
+        else:
+            query = 'SELECT RecipeId FROM recipes ORDER BY RANDOM() LIMIT 6'
+            cursor.execute(query)
+
+        random_ids = [row['RecipeId'] for row in cursor.fetchall()]
+
+        # Fetch recipe details
+        all_ids = list(set(summary_ids + category_ids + random_ids))
+        recipes = []
+        if all_ids:
+            placeholders = ','.join(['?'] * len(all_ids))
+            cursor.execute(f'''
+                SELECT RecipeId as id, Name as title, Description as description,
+                       Keywords as tags, Images as images 
+                FROM recipes WHERE RecipeId IN ({placeholders})
+            ''', all_ids)
+            recipes = [dict(row) for row in cursor.fetchall()]
+
+        # Organize results
+        recipe_map = {r['id']: r for r in recipes}
+
+        return jsonify({
+            'summary': [format_recipe(recipe_map[id]) for id in summary_ids if id in recipe_map][:6],
+            'randomCategory': {
+                'folderName': folder_name,
+                'recipes': [format_recipe(recipe_map[id]) for id in category_ids if id in recipe_map][:6]
+            },
+            'randomDishes': [format_recipe(recipe_map[id]) for id in random_ids if id in recipe_map][:6]
+        })
+
+    except sqlite3.Error as e:
+        return jsonify({'error': f'Database error: {str(e)}'}), 500
+    except Exception as e:
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
+    finally:
+        conn.close()
+
+def format_recipe(recipe):
+    return {
+        **recipe,
+        'tags': parse_r_vector(recipe.get('tags', '')),
+        'images': parse_r_vector(recipe.get('images', ''))
+    }
